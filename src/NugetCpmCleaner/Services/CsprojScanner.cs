@@ -1,7 +1,7 @@
 namespace NugetCpmCleaner.Services;
 
-using System.Xml;
-using System.Xml.Linq;
+using System.Diagnostics;
+using System.Text.Json;
 using Spectre.Console;
 
 public sealed class CsprojScanner
@@ -10,29 +10,78 @@ public sealed class CsprojScanner
     {
         var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        var files = Directory
-            .EnumerateFiles(rootDirectory, "*.csproj", SearchOption.AllDirectories)
-            .Concat(Directory.EnumerateFiles(rootDirectory, "Directory.Build.props", SearchOption.AllDirectories));
+        var projects = Directory.EnumerateFiles(rootDirectory, "*.csproj", SearchOption.AllDirectories).ToList();
 
-        foreach (var file in files)
-        {
-            try
+        AnsiConsole.Progress()
+            .AutoClear(true)
+            .Columns(
+                new TaskDescriptionColumn(),
+                new ProgressBarColumn(),
+                new CounterColumn(projects.Count),
+                new SpinnerColumn())
+            .Start(ctx =>
             {
-                var doc = XDocument.Load(file);
-                foreach (var name in doc
-                    .Descendants("PackageReference")
-                    .Select(e => e.Attribute("Include")?.Value)
-                    .Where(n => n is not null))
+                var task = ctx.AddTask("Evaluating projects", maxValue: projects.Count);
+
+                foreach (var csproj in projects)
                 {
-                    used.Add(name!);
+                    task.Description = $"[grey]{Markup.Escape(Path.GetFileName(csproj))}[/]";
+
+                    try
+                    {
+                        var output = RunMsBuild(csproj);
+                        foreach (var name in ParsePackageNames(output))
+                            used.Add(name);
+                    }
+                    catch (Exception ex)
+                    {
+                        AnsiConsole.MarkupLine($"[yellow]Warning:[/] Could not evaluate [grey]{Markup.Escape(csproj)}[/]: {Markup.Escape(ex.Message)}");
+                    }
+
+                    task.Increment(1);
                 }
-            }
-            catch (XmlException ex)
-            {
-                AnsiConsole.MarkupLine($"[yellow]Warning:[/] Could not parse [grey]{Markup.Escape(file)}[/]: {Markup.Escape(ex.Message)}");
-            }
-        }
+            });
 
         return used;
+    }
+
+    private static string RunMsBuild(string csprojPath)
+    {
+        var psi = new ProcessStartInfo("dotnet", $"msbuild \"{csprojPath}\" -getItem:PackageReference")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        using var process = Process.Start(psi)!;
+        var output = process.StandardOutput.ReadToEnd();
+        process.WaitForExit();
+
+        return output;
+    }
+
+    private static IEnumerable<string> ParsePackageNames(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            yield break;
+
+        using var doc = JsonDocument.Parse(json);
+
+        // dotnet msbuild -getItem returns: { "Items": { "PackageReference": [...] } }
+        // or directly: { "PackageReference": [...] } depending on the SDK version
+        var root = doc.RootElement;
+        if (root.TryGetProperty("Items", out var items))
+            root = items;
+
+        if (!root.TryGetProperty("PackageReference", out var packages))
+            yield break;
+
+        foreach (var package in packages.EnumerateArray())
+        {
+            if (package.TryGetProperty("Identity", out var identity))
+                yield return identity.GetString()!;
+        }
     }
 }
