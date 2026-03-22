@@ -67,7 +67,7 @@ Done. Removed 2 package(s) from Directory.Packages.props:
 
 ## Requirements
 
-- .NET 10 or later
+- .NET 8 or later
 
 ## License
 
